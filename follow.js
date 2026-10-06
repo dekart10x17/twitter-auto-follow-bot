@@ -2,13 +2,17 @@
   let isRunning = false;
   let autoMode = false;
   let unfollowMode = false;
+  let autoFarmMode = false;
   let autoModeInterval = null;
   let unfollowModeInterval = null;
+  let autoFarmInterval = null;
   let autoModeFollowCount = 0;
   let unfollowModeCount = 0;
   let autoModeSeenUsers = new Set();
   let followedUsersList = [];
   let startTime = Date.now();
+  
+  let profileQueue = [];
   
   let isCoolingDown = false;
   let cooldownTimer = null;
@@ -24,6 +28,7 @@
       statusEl.textContent = message;
     }
   };
+
   const triggerCooldown = (resetTimeMs) => {
     if (isCoolingDown) return;
     isCoolingDown = true;
@@ -98,12 +103,6 @@
     const directMatch = text.match(/@([\w_]+)/);
     if (directMatch) return directMatch[1];
     
-    const ariaLabel = element.getAttribute("aria-label");
-    if (ariaLabel) {
-      const match = ariaLabel.match(/(?:Follow|Takip(?:\s+et)?)\s+@([\w_]+)/i);
-      if (match) return match[1];
-    }
-    
     const profileLink = element.querySelector('a[href^="/"]');
     if (profileLink) {
       const match = profileLink.getAttribute("href")?.match(/^\/([^\/]+)(?:\/|$)/);
@@ -112,42 +111,69 @@
     return null;
   };
 
+  const harvestProfiles = () => {
+    const cells = document.querySelectorAll('[data-testid="UserCell"], article[data-testid="tweet"]');
+    for (const cell of cells) {
+      const link = cell.querySelector('a[href^="/"][role="link"]');
+      if (link) {
+        const href = link.getAttribute('href');
+        if (href && href.split('/').length === 2 && !href.includes('/status/')) {
+          const profileUrl = `${href}/followers`;
+          if (!profileQueue.includes(profileUrl)) {
+            profileQueue.push(profileUrl);
+          }
+        }
+      }
+    }
+  };
+
   const collectFollowTargets = (seenUsers) => {
-    const onlyVerified = document.getElementById('tw-verified-only').checked;
+    const onlyVerified = document.getElementById('tw-verified-only')?.checked;
+    const skipVerified = document.getElementById('tw-skip-verified')?.checked;
     const rawElements = [];
     
+    // Genişletilmiş seçiciler ile ekrandaki tüm potansiyel takip butonları/hücreleri toplanır
     const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
     const userCells = Array.from(document.querySelectorAll('[data-testid="UserCell"]'));
-    const allNodes = [...articles, ...userCells];
+    const allButtons = Array.from(document.querySelectorAll('button[data-testid$="-follow"]'));
+    
+    const allNodes = [...userCells, ...articles, ...allButtons];
 
     for (const node of allNodes) {
       if (node.dataset.autoFollowLocked === "true") continue;
 
-      const isVerified = hasVerifiedBadge(node);
+      // Konteyner tespiti
+      const container = node.closest('[data-testid="UserCell"]') || node.closest('article[data-testid="tweet"]') || node.closest('div[data-testid="cellInnerDiv"]');
+      
+      const isVerified = container ? hasVerifiedBadge(container) : hasVerifiedBadge(node);
+      
       if (onlyVerified && !isVerified) continue;
+      if (skipVerified && isVerified) continue; // Mavi tikliyse atla
 
-      const username = extractUsername(node);
+      const username = container ? extractUsername(container) : extractUsername(node);
       if (!username) continue;
 
       let actionType = null;
       let triggerElement = null;
 
-      if (node.tagName.toLowerCase() === 'article') {
-        const menuButton = node.querySelector('button[data-testid="caret"]');
+      // Doğrudan follow butonu mu?
+      const followBtn = node.tagName === 'BUTTON' && node.getAttribute('data-testid')?.endsWith('-follow') 
+        ? node 
+        : container?.querySelector('button[data-testid$="-follow"]');
+
+      if (followBtn) {
+        actionType = 'direct';
+        triggerElement = followBtn;
+      } else if (container && container.tagName.toLowerCase() === 'article') {
+        const menuButton = container.querySelector('button[data-testid="caret"]');
         if (menuButton) {
           actionType = 'menu';
           triggerElement = menuButton;
         }
-      } else {
-        const followBtn = node.querySelector('button[data-testid$="-follow"]');
-        if (followBtn) {
-          actionType = 'direct';
-          triggerElement = followBtn;
-        }
       }
 
       if (triggerElement && !rawElements.some(item => item.username === username)) {
-        rawElements.push({ node, triggerElement, actionType, username });
+        rawElements.push({ node: container || node, triggerElement, actionType, username });
       }
     }
     
@@ -233,6 +259,74 @@
     isRunning = false;
   };
 
+  const runAutoFarmCycle = async () => {
+    if (!autoFarmMode || isRunning || isCoolingDown) return;
+    isRunning = true;
+
+    harvestProfiles();
+
+    const targets = collectFollowTargets(autoModeSeenUsers);
+
+    if (targets.length > 0) {
+      const target = targets[0];
+      try {
+        const { node, triggerElement, actionType, username } = target;
+        let success = false;
+
+        if (actionType === 'direct') {
+          triggerElement.click();
+          success = true;
+          await wait(randomBetween([1500, 2500]));
+        } else if (actionType === 'menu') {
+          triggerElement.click();
+          await wait(500);
+          
+          const menuItems = Array.from(document.querySelectorAll('div[role="menuitem"]'));
+          const followItem = menuItems.find(item => {
+            const text = item.textContent?.toLowerCase();
+            return text?.includes('takip et') || text?.includes('follow');
+          });
+          
+          if (followItem) {
+            followItem.click();
+            success = true;
+          } else {
+            document.body.click();
+          }
+        }
+
+        if (success) {
+          node.dataset.autoFollowLocked = "true";
+          autoModeFollowCount++;
+          followedUsersList.push({ username, timestamp: Date.now() });
+          log(`Farm Followed: @${username} (Total: ${autoModeFollowCount})`);
+          document.getElementById('tw-farm-btn').textContent = `Stop Auto Farm (${autoModeFollowCount})`;
+        }
+        await wait(randomBetween([2000, 3000]));
+        isRunning = false;
+        return;
+      } catch (e) {
+        console.error(e);
+      }
+    } else {
+      if (profileQueue.length > 0) {
+        const nextProfileUrl = profileQueue.shift();
+        log(`Switching queue: ${nextProfileUrl}`);
+        
+        window.history.pushState({}, '', nextProfileUrl);
+        window.dispatchEvent(new PopStateEvent('popstate'));
+        
+        await wait(3000);
+      } else {
+        log("Queue empty, scrolling down...");
+        window.scrollBy({ top: window.innerHeight * 0.8, behavior: "smooth" });
+        await wait(2000);
+      }
+    }
+
+    isRunning = false;
+  };
+
   const runUnfollowCycle = async () => {
     if (!unfollowMode || isRunning || isCoolingDown) return;
     isRunning = true;
@@ -307,12 +401,18 @@
     panel.innerHTML = `
       <h3 style="margin:0 0 12px;font-size:13px;color:#fff;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #333;padding-bottom:6px;font-weight:normal;">Auto Bot</h3>
       
-      <div style="margin-bottom: 12px; display: flex; align-items: center; font-size: 11px;">
+      <div style="margin-bottom: 8px; display: flex; align-items: center; font-size: 11px;">
         <input type="checkbox" id="tw-verified-only" style="margin-right: 8px; width: 14px; height: 14px; accent-color: #000;">
         <label for="tw-verified-only" style="cursor: pointer;">Follow Verified Only</label>
       </div>
 
+      <div style="margin-bottom: 12px; display: flex; align-items: center; font-size: 11px;">
+        <input type="checkbox" id="tw-skip-verified" style="margin-right: 8px; width: 14px; height: 14px; accent-color: #000;">
+        <label for="tw-skip-verified" style="cursor: pointer;">Skip Verified Accounts</label>
+      </div>
+
       <button id="tw-follow-btn" style="${btnStyle}">Start Auto Follow</button>
+      <button id="tw-farm-btn" style="${btnStyle}">Start Auto Farm</button>
       <button id="tw-unfollow-btn" style="${btnStyle}">Start Auto Unfollow</button>
       
       <div style="height:1px; background:#333; margin:12px 0;"></div>
@@ -344,12 +444,26 @@
       } else {
         autoMode = true;
         toggleButtonState(e.target, true, "Start Auto Follow");
-        
-        const isVerifiedOnly = document.getElementById('tw-verified-only').checked;
-        log(`Started following... (${isVerifiedOnly ? 'Verified Only' : 'Everyone'})`);
+        log("Started following...");
         
         runAutoFollowCycle();
         autoModeInterval = setInterval(runAutoFollowCycle, 5000);
+      }
+    });
+
+    document.getElementById("tw-farm-btn").addEventListener("click", (e) => {
+      if (autoFarmMode) {
+        autoFarmMode = false;
+        clearInterval(autoFarmInterval);
+        toggleButtonState(e.target, false, "Start Auto Farm");
+        log("Auto Farm stopped.");
+      } else {
+        autoFarmMode = true;
+        toggleButtonState(e.target, true, "Start Auto Farm");
+        log("Auto Farm started (Queue loop mode).");
+        
+        runAutoFarmCycle();
+        autoFarmInterval = setInterval(runAutoFarmCycle, 6000);
       }
     });
 
